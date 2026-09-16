@@ -11,10 +11,14 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <hidapi.h>
 
 #define VID 0x258A
@@ -117,6 +121,20 @@ static const struct effect_name k_effects[] = {
     {NULL, 0}
 };
 
+/* One resolved lighting request, so `idle` can replay the same CLI action. */
+struct action {
+    int want_effect;
+    unsigned char mode;
+    unsigned char rgb[3];
+    unsigned char brightness;
+    int random_colors;
+};
+
+/* Silences the per-send chatter while the idle loop is running. */
+static int g_quiet;
+
+static volatile sig_atomic_t g_stop;
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
@@ -126,13 +144,19 @@ static void usage(const char *argv0)
             "  %s static <rrggbb|#rrggbb|red|green|blue|white|off> [--brightness 0-4]\n"
             "  %s effect <name> [--brightness 0-4] [--random]\n"
             "  %s off\n"
+            "  %s idle [--timeout SECS] [--poll SECS] <static ...|effect ...|off>\n"
             "\n"
             "Effects: off static breathe rainbow flash raindrops wheel ripples\n"
             "         stars shadow snake neon reaction wave scan windmill\n"
             "         waterfall blossom storm collision\n"
             "\n"
+            "idle blanks the leds after SECS with no HID input (read from the\n"
+            "macOS IOHIDSystem HIDIdleTime property) and restores the given\n"
+            "lighting on the next input. Defaults: --timeout 300 --poll 1.\n"
+            "Runs in the foreground; ctrl-c restores the lighting and exits.\n"
+            "\n"
             "Controls BY Tech Gaming Keyboard (258A:0049) RGB via HID feature reports.\n",
-            argv0, argv0, argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int hex_nibble(int c)
@@ -373,8 +397,10 @@ static int send_static(hid_device *dev, unsigned char rgb[3], unsigned char brig
         return 1;
     }
 
-    printf("static rgb=%02x%02x%02x brightness=0x%02x (mode=0x01, no random)\n",
-           rgb[0], rgb[1], rgb[2], brightness);
+    if (!g_quiet) {
+        printf("static rgb=%02x%02x%02x brightness=0x%02x (mode=0x01, no random)\n",
+               rgb[0], rgb[1], rgb[2], brightness);
+    }
     if (dry_run) {
         printf("mode packet:\n");
         print_hex(mode, 96);
@@ -391,7 +417,9 @@ static int send_static(hid_device *dev, unsigned char rgb[3], unsigned char brig
     if (send_report(dev, color) < 0) {
         return 1;
     }
-    printf("sent static mode + color reports\n");
+    if (!g_quiet) {
+        printf("sent static mode + color reports\n");
+    }
     return 0;
 }
 
@@ -403,8 +431,10 @@ static int send_effect(hid_device *dev, unsigned char mode, unsigned char bright
         fprintf(stderr, "failed to build mode packet\n");
         return 1;
     }
-    printf("effect mode=0x%02x brightness=0x%02x random=%s\n",
-           mode, brightness, random_colors ? "yes" : "no");
+    if (!g_quiet) {
+        printf("effect mode=0x%02x brightness=0x%02x random=%s\n",
+               mode, brightness, random_colors ? "yes" : "no");
+    }
     if (dry_run) {
         print_hex(buf, 96);
         return 0;
@@ -412,8 +442,204 @@ static int send_effect(hid_device *dev, unsigned char mode, unsigned char bright
     if (send_report(dev, buf) < 0) {
         return 1;
     }
-    printf("sent effect report\n");
+    if (!g_quiet) {
+        printf("sent effect report\n");
+    }
     return 0;
+}
+
+/*
+ * argv[i] is the verb (off/static/effect); the rest are its options.
+ * dry_run may be NULL when the caller does not accept --dry-run.
+ */
+static int parse_action(int argc, char **argv, int i, struct action *a, int *dry_run)
+{
+    a->want_effect = 0;
+    a->mode = MODE_STATIC;
+    a->rgb[0] = 255;
+    a->rgb[1] = 0;
+    a->rgb[2] = 0;
+    a->brightness = 0x34;
+    a->random_colors = 0;
+
+    if (i >= argc) {
+        return -1;
+    }
+
+    if (strcmp(argv[i], "off") == 0) {
+        a->rgb[0] = a->rgb[1] = a->rgb[2] = 0;
+        a->brightness = BRIGHTNESS_OFF;
+        i++;
+    } else if (strcmp(argv[i], "static") == 0) {
+        if (i + 1 >= argc) {
+            return -1;
+        }
+        if (parse_color(argv[i + 1], a->rgb) != 0) {
+            fprintf(stderr, "invalid color '%s'\n", argv[i + 1]);
+            return -1;
+        }
+        i += 2;
+    } else if (strcmp(argv[i], "effect") == 0) {
+        if (i + 1 >= argc) {
+            return -1;
+        }
+        if (lookup_effect(argv[i + 1], &a->mode) != 0) {
+            fprintf(stderr, "unknown effect '%s'\n", argv[i + 1]);
+            return -1;
+        }
+        a->want_effect = 1;
+        i += 2;
+    } else {
+        return -1;
+    }
+
+    for (; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0 && dry_run) {
+            *dry_run = 1;
+        } else if (strcmp(argv[i], "--random") == 0 && a->want_effect) {
+            a->random_colors = 1;
+        } else if (strcmp(argv[i], "--brightness") == 0 && i + 1 < argc) {
+            int b = atoi(argv[++i]);
+            if (b < 0 || b > 4) {
+                fprintf(stderr, "brightness must be 0-4\n");
+                return -1;
+            }
+            a->brightness = (unsigned char)(0x30 + b);
+        } else {
+            fprintf(stderr, "unknown option %s\n", argv[i]);
+            return -1;
+        }
+    }
+
+    if (a->want_effect) {
+        if (a->mode == MODE_RAINBOW || a->mode == MODE_RAINBOW_WHEEL ||
+            a->mode == MODE_SINE_WAVE || a->mode == MODE_NEON ||
+            a->mode == MODE_WATERFALL) {
+            a->random_colors = 1;
+        }
+    } else if (a->rgb[0] == 0 && a->rgb[1] == 0 && a->rgb[2] == 0) {
+        a->brightness = BRIGHTNESS_OFF;
+    }
+    return 0;
+}
+
+static int send_action(hid_device *dev, const struct action *a, int dry_run)
+{
+    unsigned char rgb[3];
+
+    if (a->want_effect) {
+        return send_effect(dev, a->mode, a->brightness, a->random_colors, dry_run);
+    }
+    memcpy(rgb, a->rgb, sizeof rgb);
+    return send_static(dev, rgb, a->brightness, dry_run);
+}
+
+/*
+ * Seconds since the last input on any HID device, from IOHIDSystem's
+ * HIDIdleTime (nanoseconds). Negative on failure.
+ */
+static long hid_idle_seconds(void)
+{
+    io_iterator_t iter;
+    io_registry_entry_t entry;
+    CFTypeRef prop;
+    int64_t ns = -1;
+
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("IOHIDSystem"),
+                                     &iter) != KERN_SUCCESS) {
+        return -1;
+    }
+    entry = IOIteratorNext(iter);
+    IOObjectRelease(iter);
+    if (!entry) {
+        return -1;
+    }
+
+    prop = IORegistryEntryCreateCFProperty(entry, CFSTR("HIDIdleTime"),
+                                           kCFAllocatorDefault, 0);
+    IOObjectRelease(entry);
+    if (!prop) {
+        return -1;
+    }
+    if (CFGetTypeID(prop) == CFNumberGetTypeID()) {
+        CFNumberGetValue((CFNumberRef)prop, kCFNumberSInt64Type, &ns);
+    }
+    CFRelease(prop);
+    return ns < 0 ? -1 : (long)(ns / 1000000000LL);
+}
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+}
+
+/*
+ * Blank the leds after `timeout` idle seconds and restore `on` at the next
+ * input. While lit there is nothing to react to, so we sleep straight to the
+ * deadline; while dark we poll so the restore feels immediate.
+ */
+static int cmd_idle(hid_device *dev, const struct action *on, long timeout, long poll)
+{
+    struct action dark;
+    int lit = 1;
+    int rc = 0;
+
+    memset(&dark, 0, sizeof dark);
+    dark.mode = MODE_STATIC;
+    dark.brightness = BRIGHTNESS_OFF;
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    printf("idle: off after %lds, %lds poll while dark, ctrl-c restores\n", timeout, poll);
+    fflush(stdout);
+
+    if (send_action(dev, on, 0) != 0) {
+        return 1;
+    }
+    g_quiet = 1;
+
+    while (!g_stop) {
+        long idle = hid_idle_seconds();
+
+        if (idle < 0) {
+            fprintf(stderr, "cannot read HIDIdleTime from IOHIDSystem\n");
+            rc = 1;
+            break;
+        }
+
+        if (lit && idle >= timeout) {
+            if (send_action(dev, &dark, 0) != 0) {
+                rc = 1;
+                break;
+            }
+            lit = 0;
+            printf("idle %lds: leds off\n", idle);
+            fflush(stdout);
+        } else if (!lit && idle < timeout) {
+            if (send_action(dev, on, 0) != 0) {
+                rc = 1;
+                break;
+            }
+            lit = 1;
+            printf("input after %lds: leds restored\n", idle);
+            fflush(stdout);
+        }
+
+        if (g_stop) {
+            break;
+        }
+        sleep((unsigned int)(lit ? (timeout - idle > 1 ? timeout - idle : 1) : poll));
+    }
+
+    if (!lit) {
+        g_quiet = 0;
+        printf("restoring leds\n");
+        send_action(dev, on, 0);
+    }
+    return rc;
 }
 
 static int cmd_list(void)
@@ -470,12 +696,8 @@ static int cmd_dump(int report_id)
 
 int main(int argc, char **argv)
 {
-    unsigned char rgb[3] = {255, 0, 0};
-    unsigned char brightness = 0x34;
-    unsigned char effect_mode = MODE_STATIC;
+    struct action act;
     int dry_run = 0;
-    int random_colors = 0;
-    int want_effect = 0;
     hid_device *dev;
     int rc;
 
@@ -510,97 +732,57 @@ int main(int argc, char **argv)
         return rc;
     }
 
-    if (strcmp(argv[1], "off") == 0) {
-        rgb[0] = rgb[1] = rgb[2] = 0;
-        brightness = BRIGHTNESS_OFF;
-    } else if (strcmp(argv[1], "static") == 0) {
-        if (argc < 3) {
+    if (strcmp(argv[1], "idle") == 0) {
+        long timeout = 300;
+        long poll = 1;
+        int i = 2;
+
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+                timeout = atol(argv[++i]);
+            } else if (strcmp(argv[i], "--poll") == 0 && i + 1 < argc) {
+                poll = atol(argv[++i]);
+            } else {
+                break;
+            }
+        }
+        if (timeout < 1 || poll < 1) {
+            fprintf(stderr, "--timeout and --poll must be at least 1 second\n");
+            hid_exit();
+            return 2;
+        }
+        if (parse_action(argc, argv, i, &act, NULL) != 0) {
             usage(argv[0]);
             hid_exit();
             return 2;
         }
-        if (parse_color(argv[2], rgb) != 0) {
-            fprintf(stderr, "invalid color '%s'\n", argv[2]);
+        dev = open_led_interface();
+        if (!dev) {
             hid_exit();
-            return 2;
+            return 1;
         }
-        for (int i = 3; i < argc; i++) {
-            if (strcmp(argv[i], "--dry-run") == 0) {
-                dry_run = 1;
-            } else if (strcmp(argv[i], "--brightness") == 0 && i + 1 < argc) {
-                int b = atoi(argv[++i]);
-                if (b < 0 || b > 4) {
-                    fprintf(stderr, "brightness must be 0-4\n");
-                    hid_exit();
-                    return 2;
-                }
-                brightness = (unsigned char)(0x30 + b);
-            } else {
-                fprintf(stderr, "unknown option %s\n", argv[i]);
-                hid_exit();
-                return 2;
-            }
-        }
-        if (rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 0) {
-            brightness = BRIGHTNESS_OFF;
-        }
-    } else if (strcmp(argv[1], "effect") == 0) {
-        if (argc < 3) {
-            usage(argv[0]);
-            hid_exit();
-            return 2;
-        }
-        if (lookup_effect(argv[2], &effect_mode) != 0) {
-            fprintf(stderr, "unknown effect '%s'\n", argv[2]);
-            hid_exit();
-            return 2;
-        }
-        want_effect = 1;
-        for (int i = 3; i < argc; i++) {
-            if (strcmp(argv[i], "--dry-run") == 0) {
-                dry_run = 1;
-            } else if (strcmp(argv[i], "--random") == 0) {
-                random_colors = 1;
-            } else if (strcmp(argv[i], "--brightness") == 0 && i + 1 < argc) {
-                int b = atoi(argv[++i]);
-                if (b < 0 || b > 4) {
-                    fprintf(stderr, "brightness must be 0-4\n");
-                    hid_exit();
-                    return 2;
-                }
-                brightness = (unsigned char)(0x30 + b);
-            } else {
-                fprintf(stderr, "unknown option %s\n", argv[i]);
-                hid_exit();
-                return 2;
-            }
-        }
-        if (effect_mode == MODE_RAINBOW || effect_mode == MODE_RAINBOW_WHEEL ||
-            effect_mode == MODE_SINE_WAVE || effect_mode == MODE_NEON ||
-            effect_mode == MODE_WATERFALL) {
-            random_colors = 1;
-        }
-    } else {
+        rc = cmd_idle(dev, &act, timeout, poll);
+        hid_close(dev);
+        hid_exit();
+        return rc;
+    }
+
+    if (parse_action(argc, argv, 1, &act, &dry_run) != 0) {
         usage(argv[0]);
         hid_exit();
         return 2;
     }
 
+    dev = NULL;
     if (!dry_run) {
         dev = open_led_interface();
         if (!dev) {
             hid_exit();
             return 1;
         }
-    } else {
-        dev = NULL;
     }
 
-    if (want_effect) {
-        rc = send_effect(dev, effect_mode, brightness, random_colors, dry_run);
-    } else {
-        rc = send_static(dev, rgb, brightness, dry_run);
-    }
+    rc = send_action(dev, &act, dry_run);
     if (dev) {
         hid_close(dev);
     }

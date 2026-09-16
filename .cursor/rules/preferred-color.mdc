@@ -1,0 +1,20 @@
+---
+description: Restore the user's preferred keyboard color
+alwaysApply: true
+---
+
+# Preferred keyboard color
+
+When the user asks to restore, change back, or set their usual/saved color, apply static `#ff2800` (rgb 255, 40, 0).
+
+```bash
+./kbdled static '#ff2800'
+```
+
+Cursor cannot open the HID device (Input Monitoring). Run it through Ghostty:
+
+```bash
+open -na Ghostty.app --args -e /bin/zsh -lc 'cd /Users/augustodoregofranke/Developer/bytech-kbd-led && ./kbdled static "#ff2800"'
+```
+
+Do not use the named color `orange` (`#ff8000`); that reads yellow on this keyboard. A firmware/OS shortcut often sets purple by mistake; `#ff2800` is the color to put back.
